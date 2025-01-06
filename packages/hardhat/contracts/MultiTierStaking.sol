@@ -9,12 +9,9 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
 
-/**
- * @title MultiTierStaking
- * @dev Implements upgradeable pattern, role-based access, and complete security measures
- * @custom:security-contact security@yourdomain.com
- */
 contract MultiTierStaking is 
     ReentrancyGuardUpgradeable, 
     PausableUpgradeable, 
@@ -22,32 +19,51 @@ contract MultiTierStaking is
     UUPSUpgradeable 
 {
     using SafeMath for uint256;
+    using Address for address;
+
+    // Version control
+    string public constant VERSION = "2.0.0";
+    uint256 public constant UPGRADE_TIMELOCK = 2 days;
+    uint256 public lastUpgradeTimestamp;
 
     // Roles
     bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     bytes32 public constant TREASURY_ROLE = keccak256("TREASURY_ROLE");
+    bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
 
-    // Version control
-    string public constant VERSION = "1.0.0";
+    // Constants
+    uint256 public constant MAX_TIER_REWARD_RATE = 3000; // 30% max APY
+    uint256 public constant MIN_STAKE_DURATION = 1 days;
+    uint256 public constant MAX_STAKE_DURATION = 365 days;
+    uint256 public constant COOLDOWN_PERIOD = 1 days;
+    uint256 public constant MAX_FEE = 1000; // 10% max fee
+    uint256 public constant PROPOSAL_EXECUTION_DELAY = 2 days;
+    uint256 public constant MAX_TOKENS = 10;
+    uint256 public constant MINIMUM_PROPOSAL_DESCRIPTION_LENGTH = 100;
 
     // Staking tiers
     struct Tier {
         uint256 minimumStake;
         uint256 rewardRate; // basis points per year
         uint256 lockPeriod; // in seconds
+        uint256 maxRewardCap; // maximum reward possible
         bool active;
+        bool compoundingAllowed;
     }
 
-    // Stake information
+    // Enhanced stake information
     struct Stake {
         uint256 amount;
         uint256 startTime;
         uint256 endTime;
         uint256 lastClaimTime;
+        uint256 accumulatedRewards;
         uint8 tierId;
         bool locked;
+        bool compounding;
+        uint256 cooldownEnd;
     }
 
     // Treasury
@@ -56,6 +72,9 @@ contract MultiTierStaking is
         uint96 fee; // basis points (1/10000)
         uint256 collectedFees;
         bool feesEnabled;
+        uint256 rewardPool;
+        uint256 totalStaked;
+        uint256 lastUpdateTime;
     }
 
     // Recovery
@@ -63,19 +82,35 @@ contract MultiTierStaking is
         address newAddress;
         uint256 requestTime;
         bool pending;
+        bytes32 requestHash;
+        uint256 securityDelay;
     }
 
-    // Governance
+    // Enhanced governance
     struct Proposal {
         bytes32 proposalHash;
         uint256 votingEnds;
+        uint256 executionTime;
         uint256 votesFor;
         uint256 votesAgainst;
         uint256 totalVotes;
         bool executed;
         bool cancelled;
+        bool vetoed;
         address proposer;
+        string description;
+        address target;
+        bytes data;
         mapping(address => bool) hasVoted;
+        mapping(address => uint256) delegatedPower;
+    }
+
+    // Reward pool tracking
+    struct RewardPoolInfo {
+        uint256 totalRewards;
+        uint256 distributedRewards;
+        uint256 lastUpdateBlock;
+        mapping(address => uint256) userRewardDebt;
     }
 
     // State variables
@@ -85,6 +120,8 @@ contract MultiTierStaking is
     address[] public supportedTokens;
     mapping(address => bool) public isTokenSupported;
     mapping(address => bool) public hasBeenUsed;
+    mapping(address => address) public delegations;
+    mapping(address => uint256) public slashingHistory;
     
     TreasuryInfo public treasuryInfo;
     address public recoveryAdmin;
@@ -93,41 +130,51 @@ contract MultiTierStaking is
     
     mapping(uint256 => Proposal) public proposals;
     uint256 public proposalCount;
-    uint256 public constant VOTING_PERIOD = 7 days;
-    uint256 public constant PROPOSAL_THRESHOLD = 100 ether;
-    uint256 public constant MINIMUM_QUORUM = 1000 ether;
+    RewardPoolInfo public rewardPool;
     
     // Circuit breakers
     uint256 public constant MAX_DAILY_STAKE = 10000 ether;
     uint256 public dailyStakeAmount;
     uint256 public lastStakeReset;
+    bool public emergencyShutdown;
     
     // Rate limiting
     mapping(address => uint256) public lastActionTime;
-    uint256 public constant ACTION_DELAY = 1 hours;
+    mapping(address => uint256) public upgradeProposalTimestamp;
 
     // Events
-    event TierCreated(uint8 tierId, uint256 minimumStake, uint256 rewardRate, uint256 lockPeriod);
-    event TierUpdated(uint8 tierId, uint256 minimumStake, uint256 rewardRate, uint256 lockPeriod);
-    event Staked(address indexed user, uint256 amount, uint8 tierId);
-    event Unstaked(address indexed user, uint256 amount);
-    event RewardsClaimed(address indexed user, uint256 amount);
+    event TierCreated(uint8 tierId, uint256 minimumStake, uint256 rewardRate, uint256 lockPeriod, uint256 maxRewardCap);
+    event TierUpdated(uint8 tierId, uint256 minimumStake, uint256 rewardRate, uint256 lockPeriod, uint256 maxRewardCap);
+    event Staked(address indexed user, uint256 amount, uint8 tierId, bool compounding);
+    event Unstaked(address indexed user, uint256 amount, uint256 rewards);
+    event RewardsClaimed(address indexed user, uint256 amount, uint8 tierId);
     event TokenAdded(address indexed token);
     event TokenRemoved(address indexed token);
-    event RecoveryRequested(address indexed account, address indexed newAddress);
+    event RecoveryRequested(address indexed account, address indexed newAddress, bytes32 requestHash);
     event RecoveryCancelled(address indexed account);
     event RecoveryExecuted(address indexed oldAddress, address indexed newAddress);
-    event ProposalCreated(uint256 indexed proposalId, address indexed proposer, bytes32 proposalHash);
+    event ProposalCreated(uint256 indexed proposalId, address indexed proposer, bytes32 proposalHash, string description);
     event ProposalCancelled(uint256 indexed proposalId, address indexed canceller);
     event ProposalVoted(uint256 indexed proposalId, address indexed voter, bool support, uint256 weight);
     event ProposalExecuted(uint256 indexed proposalId);
+    event ProposalVetoed(uint256 indexed proposalId, address indexed admin);
+    event DelegationUpdated(address indexed delegator, address indexed delegatee);
+    event RewardPoolUpdated(uint256 amount, bool isAddition);
+    event EmergencyShutdown(bool enabled);
+    event Slashed(address indexed user, uint256 amount, string reason);
+    event CompoundingUpdated(address indexed user, bool enabled);
+    event UpgradeProposed(address indexed newImplementation);
     event TreasuryFeeUpdated(uint256 newFee);
     event TreasuryFeesToggled(bool enabled);
     event EmergencyWithdraw(address indexed token, uint256 amount);
+    event RewardsAdded(uint256 amount);
+    event TierUpgraded(address indexed user, uint8 oldTierId, uint8 newTierId);
 
     // Modifiers
     modifier notUsedAddress(address _address) {
         require(!hasBeenUsed[_address], "Address previously used");
+        require(_address != address(0), "Invalid address");
+        require(!_address.isContract(), "Contract addresses not allowed");
         _;
     }
 
@@ -161,6 +208,21 @@ contract MultiTierStaking is
         dailyStakeAmount = dailyStakeAmount.add(amount);
     }
 
+    modifier notEmergency() {
+        require(!emergencyShutdown, "Contract is in emergency shutdown");
+        _;
+    }
+
+    modifier onlyValidTier(uint8 tierId) {
+        require(tiers[tierId].active, "Invalid or inactive tier");
+        _;
+    }
+
+    modifier onlyValidToken(address token) {
+        require(isTokenSupported[token], "Token not supported");
+        _;
+    }
+
     // Initialization
     function initialize(
         address _treasury,
@@ -177,6 +239,7 @@ contract MultiTierStaking is
         _setupRole(ADMIN_ROLE, msg.sender);
         _setupRole(OPERATOR_ROLE, msg.sender);
         _setupRole(TREASURY_ROLE, _treasury);
+        _setupRole(EMERGENCY_ROLE, msg.sender);
 
         treasuryInfo.treasury = _treasury;
         treasuryInfo.fee = 100; // 1% default fee
@@ -185,6 +248,9 @@ contract MultiTierStaking is
         recoveryAdmin = _recoveryAdmin;
         recoveryDelay = _recoveryDelay;
         lastStakeReset = block.timestamp;
+        
+        rewardPool.lastUpdateBlock = block.number;
+        emergencyShutdown = false;
     }
 
     // Core staking functions
@@ -192,31 +258,53 @@ contract MultiTierStaking is
         uint8 _tierId,
         uint256 _minimumStake,
         uint256 _rewardRate,
-        uint256 _lockPeriod
+        uint256 _lockPeriod,
+        uint256 _maxRewardCap,
+        bool _compoundingAllowed
     ) external onlyRole(ADMIN_ROLE) {
         require(!tiers[_tierId].active, "Tier exists");
-        require(_rewardRate <= 10000, "Rate too high"); // Max 100%
+        require(_rewardRate <= MAX_TIER_REWARD_RATE, "Rate too high");
+        require(_lockPeriod >= MIN_STAKE_DURATION && _lockPeriod <= MAX_STAKE_DURATION, "Invalid lock period");
+        require(_minimumStake > 0, "Invalid minimum stake");
 
         tiers[_tierId] = Tier({
             minimumStake: _minimumStake,
             rewardRate: _rewardRate,
             lockPeriod: _lockPeriod,
-            active: true
+            maxRewardCap: _maxRewardCap,
+            active: true,
+            compoundingAllowed: _compoundingAllowed
         });
 
-        emit TierCreated(_tierId, _minimumStake, _rewardRate, _lockPeriod);
+        emit TierCreated(_tierId, _minimumStake, _rewardRate, _lockPeriod, _maxRewardCap);
     }
 
-    function stake(uint256 amount, uint8 tierId) 
+    function stake(
+        uint256 amount,
+        uint8 tierId,
+        bool enableCompounding
+    ) 
         external 
         nonReentrant 
         whenNotPaused 
+        notEmergency
         rateLimit 
-        circuitBreaker(amount) 
+        circuitBreaker(amount)
+        onlyValidTier(tierId)
     {
-        require(tiers[tierId].active, "Invalid tier");
         require(amount >= tiers[tierId].minimumStake, "Below minimum");
         require(!stakes[msg.sender].locked, "Already staked");
+        require(
+            block.timestamp >= stakes[msg.sender].cooldownEnd,
+            "Cooldown period active"
+        );
+
+        if (enableCompounding) {
+            require(
+                tiers[tierId].compoundingAllowed,
+                "Compounding not allowed for this tier"
+            );
+        }
 
         // Transfer tokens
         require(
@@ -232,6 +320,7 @@ contract MultiTierStaking is
         }
 
         uint256 stakeAmount = amount.sub(fee);
+        treasuryInfo.totalStaked = treasuryInfo.totalStaked.add(stakeAmount);
 
         // Create stake
         stakes[msg.sender] = Stake({
@@ -239,24 +328,46 @@ contract MultiTierStaking is
             startTime: block.timestamp,
             endTime: block.timestamp.add(tiers[tierId].lockPeriod),
             lastClaimTime: block.timestamp,
+            accumulatedRewards: 0,
             tierId: tierId,
-            locked: true
+            locked: true,
+            compounding: enableCompounding,
+            cooldownEnd: 0
         });
 
-        emit Staked(msg.sender, stakeAmount, tierId);
+        emit Staked(msg.sender, stakeAmount, tierId, enableCompounding);
     }
 
-    function unstake() external nonReentrant rateLimit {
+    function unstake() 
+        external 
+        nonReentrant 
+        rateLimit 
+    {
         Stake storage userStake = stakes[msg.sender];
         require(userStake.locked, "No active stake");
-        require(block.timestamp >= userStake.endTime, "Lock not expired");
+        require(
+            block.timestamp >= userStake.endTime || emergencyShutdown,
+            "Lock not expired"
+        );
 
         uint256 amount = userStake.amount;
         uint256 rewards = calculateRewards(msg.sender);
+        require(rewards <= tiers[userStake.tierId].maxRewardCap, "Reward cap exceeded");
+
+        // Update reward pool
+        rewardPool.distributedRewards = rewardPool.distributedRewards.add(rewards);
+        require(
+            rewardPool.distributedRewards <= rewardPool.totalRewards,
+            "Insufficient reward pool"
+        );
 
         // Reset stake
         userStake.locked = false;
         userStake.amount = 0;
+        userStake.accumulatedRewards = 0;
+        userStake.cooldownEnd = block.timestamp.add(COOLDOWN_PERIOD);
+
+        treasuryInfo.totalStaked = treasuryInfo.totalStaked.sub(amount);
 
         // Transfer tokens and rewards
         require(
@@ -264,140 +375,4 @@ contract MultiTierStaking is
             "Transfer failed"
         );
 
-        emit Unstaked(msg.sender, amount);
-        if (rewards > 0) {
-            emit RewardsClaimed(msg.sender, rewards);
-        }
-    }
-
-    function claimRewards() external nonReentrant rateLimit {
-        require(stakes[msg.sender].locked, "No active stake");
-        
-        uint256 rewards = calculateRewards(msg.sender);
-        require(rewards > 0, "No rewards");
-
-        stakes[msg.sender].lastClaimTime = block.timestamp;
-
-        require(
-            IERC20(supportedTokens[0]).transfer(msg.sender, rewards),
-            "Transfer failed"
-        );
-
-        emit RewardsClaimed(msg.sender, rewards);
-    }
-
-    // Internal functions
-    function calculateRewards(address user) internal view returns (uint256) {
-        Stake storage userStake = stakes[user];
-        if (!userStake.locked) return 0;
-
-        uint256 duration = block.timestamp.sub(userStake.lastClaimTime);
-        uint256 rate = tiers[userStake.tierId].rewardRate;
-
-        return userStake.amount.mul(rate).mul(duration).div(365 days).div(10000);
-    }
-
-    // Recovery functions
-    function requestRecovery(address newAddress) 
-        external 
-        notUsedAddress(newAddress) 
-    {
-        require(stakes[msg.sender].locked, "No active stake");
-        require(!recoveryRequests[msg.sender].pending, "Recovery pending");
-        
-        recoveryRequests[msg.sender] = RecoveryRequest({
-            newAddress: newAddress,
-            requestTime: block.timestamp,
-            pending: true
-        });
-        
-        emit RecoveryRequested(msg.sender, newAddress);
-    }
-
-    function cancelRecoveryRequest() external {
-        require(recoveryRequests[msg.sender].pending, "No recovery pending");
-        delete recoveryRequests[msg.sender];
-        emit RecoveryCancelled(msg.sender);
-    }
-
-    function executeRecovery(address oldAddress) external {
-        require(msg.sender == recoveryAdmin, "Not recovery admin");
-        RecoveryRequest storage request = recoveryRequests[oldAddress];
-        require(request.pending, "No recovery request");
-        require(
-            block.timestamp >= request.requestTime.add(recoveryDelay),
-            "Delay not passed"
-        );
-
-        address newAddress = request.newAddress;
-        
-        // Transfer stake
-        stakes[newAddress] = stakes[oldAddress];
-        delete stakes[oldAddress];
-        
-        // Transfer balances
-        for (uint i = 0; i < supportedTokens.length; i++) {
-            address token = supportedTokens[i];
-            tokenBalances[newAddress][token] = tokenBalances[oldAddress][token];
-            delete tokenBalances[oldAddress][token];
-        }
-
-        hasBeenUsed[oldAddress] = true;
-        delete recoveryRequests[oldAddress];
-        
-        emit RecoveryExecuted(oldAddress, newAddress);
-    }
-
-    // Governance functions
-    function createProposal(bytes32 proposalHash) external {
-        require(stakes[msg.sender].amount >= PROPOSAL_THRESHOLD, "Insufficient stake");
-        
-        proposalCount++;
-        Proposal storage proposal = proposals[proposalCount];
-        proposal.proposalHash = proposalHash;
-        proposal.votingEnds = block.timestamp.add(VOTING_PERIOD);
-        proposal.proposer = msg.sender;
-        
-        emit ProposalCreated(proposalCount, msg.sender, proposalHash);
-    }
-
-    function cancelProposal(uint256 proposalId) external {
-        Proposal storage proposal = proposals[proposalId];
-        require(block.timestamp < proposal.votingEnds, "Voting ended");
-        require(
-            msg.sender == proposal.proposer || 
-            hasRole(ADMIN_ROLE, msg.sender),
-            "Not authorized"
-        );
-        require(!proposal.cancelled, "Already cancelled");
-        
-        proposal.cancelled = true;
-        emit ProposalCancelled(proposalId, msg.sender);
-    }
-
-    function vote(uint256 proposalId, bool support) external {
-        Proposal storage proposal = proposals[proposalId];
-        require(block.timestamp < proposal.votingEnds, "Voting ended");
-        require(!proposal.cancelled, "Proposal cancelled");
-        require(!proposal.hasVoted[msg.sender], "Already voted");
-        require(stakes[msg.sender].locked, "Must be staker");
-
-        uint256 weight = stakes[msg.sender].amount;
-
-        if (support) {
-            proposal.votesFor = proposal.votesFor.add(weight);
-        } else {
-            proposal.votesAgainst = proposal.votesAgainst.add(weight);
-        }
-        
-        proposal.totalVotes = proposal.totalVotes.add(weight);
-        proposal.hasVoted[msg.sender] = true;
-        
-        emit ProposalVoted(proposalId, msg.sender, support, weight);
-    }
-
-    function executeProposal(
-        uint256 proposalId,
-        address target,
-        bytes memory data
-    )
+        emit Unstaked(msg.</antArtifact>
